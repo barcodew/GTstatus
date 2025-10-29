@@ -269,7 +269,7 @@ function buildEmbed({ playerInfo, modsOnline, seenTodayList }) {
           },
         ],
         footer: {
-          text: `Last Update: ${lastUpdateHuman} • Today at ${lastUpdateShort}`,
+          text: `Last Update: ${lastUpdateHuman} ${lastUpdateShort}`,
         },
         timestamp: now.toISOString(),
       },
