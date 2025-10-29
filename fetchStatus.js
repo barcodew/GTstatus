@@ -1,10 +1,9 @@
-// Made with ❤️ by Barcodew
+// Made with ❤️ by Barcodew (durasi tracking version)
 
 import fetch from "node-fetch";
 import fs from "fs";
-import path from "path";
 
-// ====== CONFIG LOAD ======
+// ====== LOAD CONFIG ======
 const cfg = JSON.parse(fs.readFileSync("./config.json", "utf8"));
 const {
   webhookUrl,
@@ -16,10 +15,45 @@ const {
   postIntervalSeconds,
 } = cfg;
 
-const savedMsgFile = "./last_message_id.txt";
-const seenTodayFile = "./seen_today.json";
+// Files for persistence
+const modStateFile = "./mod_state.json";
 
-// ====== UTIL WAKTU ======
+// ====== TIME HELPERS ======
+
+// Dapatkan waktu sekarang dalam timezone kamu, tapi kita simpan sebagai ISO string + offset kira-kira.
+// Node.js Date ga punya native timezone convert tanpa lib tambahan, jadi kita simpan UTC ISO
+// dan untuk tampilan jam HH:mm kita format pakai locale "id-ID" + timezone.
+function nowDate() {
+  return new Date();
+}
+
+// format HH:mm di timezone lokal
+function fmtHHMM(d) {
+  return d.toLocaleTimeString("id-ID", {
+    timeZone: timezone,
+    hour12: false,
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+// format durasi antara dua Date -> "X jam Y menit" / "Z menit"
+function formatDuration(ms) {
+  if (ms < 0) ms = 0;
+  const totalMinutes = Math.floor(ms / 60000);
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+
+  if (hours > 0 && minutes > 0) {
+    return `${hours} jam ${minutes} menit`;
+  } else if (hours > 0 && minutes === 0) {
+    return `${hours} jam`;
+  } else {
+    return `${minutes} menit`;
+  }
+}
+
+// full timestamp for footer
 function formatFullDateTime(d) {
   return d.toLocaleString("id-ID", {
     timeZone: timezone,
@@ -33,62 +67,69 @@ function formatFullDateTime(d) {
   });
 }
 
-function formatShortTime(d) {
-  return d.toLocaleTimeString("id-ID", {
-    timeZone: timezone,
-    hour12: false,
-    hour: "2-digit",
-    minute: "2-digit",
-  });
-}
-
-// YYYY-MM-DD lokal (biar reset harian bener sesuai zona kamu)
+// date string harian untuk reset state, pakai timezone kamu
 function getLocalDateString() {
   const now = new Date();
-  // toLocaleDateString, tapi kita mau format 2025-10-29
-  const y = now.toLocaleString("en-CA", {
+  const ymd = now.toLocaleString("en-CA", {
     timeZone: timezone,
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
     hour12: false,
-  }); // "2025-10-29"
-  return y;
+  }); // e.g. "2025-10-29"
+  return ymd;
 }
 
-// ====== SEEN TODAY STORAGE ======
-function loadSeenTodayStore() {
+// ====== STATE STORAGE ======
+function loadModState() {
   const today = getLocalDateString();
   try {
-    if (!fs.existsSync(seenTodayFile)) {
-      return { date: today, names: [] };
+    if (!fs.existsSync(modStateFile)) {
+      return { date: today, mods: {} };
     }
-    const raw = fs.readFileSync(seenTodayFile, "utf8");
+    const raw = fs.readFileSync(modStateFile, "utf8");
     const parsed = JSON.parse(raw);
 
-    // kalau tanggal beda -> reset
+    // if stale day => reset
     if (parsed.date !== today) {
-      return { date: today, names: [] };
+      return { date: today, mods: {} };
     }
-    if (!Array.isArray(parsed.names)) {
-      return { date: today, names: [] };
+
+    if (!parsed.mods || typeof parsed.mods !== "object") {
+      return { date: today, mods: {} };
     }
+
     return parsed;
   } catch {
-    return { date: today, names: [] };
+    return { date: today, mods: {} };
   }
 }
 
-function saveSeenTodayStore(store) {
-  fs.writeFileSync(
-    seenTodayFile,
-    JSON.stringify(store, null, 2),
-    "utf8"
-  );
+function saveModState(state) {
+  fs.writeFileSync(modStateFile, JSON.stringify(state, null, 2), "utf8");
 }
 
-// ====== SCRAPE MODERATOR DARI GIST (LIVE) ======
-async function getModeratorData() {
+// ====== UNDERCOVER DETECTOR ======
+function parseNameForUndercover(rawName) {
+  const name = rawName.trim();
+
+  // kailyx-undercover / kailyx_undercover / kailyx undercover
+  const m = name.match(/^(.+?)[\-_ ]?undercover$/i);
+  if (m) {
+    return { cleanName: m[1].trim(), undercover: true };
+  }
+
+  // kailyx (undercover) / kailyx-Undercover / kailyx[undercover]
+  const m2 = name.match(/^(.+?)\s*[\(\[\-]?undercover[\)\]\-]?$/i);
+  if (m2) {
+    return { cleanName: m2[1].trim(), undercover: true };
+  }
+
+  return { cleanName: name, undercover: false };
+}
+
+// ====== SCRAPE CURRENT ONLINE MOD NAMES FROM GIST ======
+async function fetchCurrentlyOnlineNames() {
   const res = await fetch(moderatorSourcePage, {
     headers: {
       "User-Agent": "Mozilla/5.0",
@@ -103,14 +144,19 @@ async function getModeratorData() {
 
   const html = await res.text();
 
-  // Ambil baris kode di gist (tiap baris di dalam <td class="blob-code ...">)
+  // Kalau gist diblokir Cloudflare / error page, ya sudah -> return empty list
+  if (!html.includes("blob-code")) {
+    console.warn("[WARN] Gist tidak mengandung blob-code (mungkin rate limited)");
+    return [];
+  }
+
   const lineMatches = [
     ...html.matchAll(
       /<td[^>]*class="blob-code[^"]*"[^>]*>([\s\S]*?)<\/td>/gi
     ),
   ];
 
-  const rawLines = lineMatches
+  const names = lineMatches
     .map((m) => m[1] || "")
     .map((cellHtml) =>
       cellHtml
@@ -125,57 +171,96 @@ async function getModeratorData() {
     )
     .filter(Boolean);
 
-  // Parser undercover
-  function parseNameForUndercover(rawName) {
-    const name = rawName.trim();
+  // names = ["misthios", "kailyx-undercover", "windyplay", ...]
+  return names;
+}
 
-    // kailyx-undercover | kailyx_undercover | kailyx undercover
-    const m = name.match(/^(.+?)[\-_ ]?undercover$/i);
-    if (m) {
-      return { cleanName: m[1].trim(), isUndercover: true };
-    }
-
-    // kailyx (undercover), kailyx-Undercover, kailyx[undercover]
-    const m2 = name.match(/^(.+?)\s*[\(\[\-]?undercover[\)\]\-]?$/i);
-    if (m2) {
-      return { cleanName: m2[1].trim(), isUndercover: true };
-    }
-
-    return { cleanName: name, isUndercover: false };
+// ====== UPDATE STATE DENGAN ONLINE SEKARANG ======
+function updateModStateWithOnlineList(state, currentNames, now) {
+  // 1. Tandai semua offline dulu
+  for (const modName in state.mods) {
+    state.mods[modName].online = false;
   }
 
-  // Ambil store lama (supaya "seen today" gak hilang pas mereka offline)
-  const store = loadSeenTodayStore();
-  const stillOnlineMods = [];
+  // 2. Masukkan / update yang online sekarang
+  for (const rawName of currentNames) {
+    const { cleanName, undercover } = parseNameForUndercover(rawName);
 
-  for (const rawLine of rawLines) {
-    const p = parseNameForUndercover(rawLine);
+    // kalau mod belum pernah ada di state hari ini → inisialisasi
+    if (!state.mods[cleanName]) {
+      state.mods[cleanName] = {
+        firstSeen: now.toISOString(), // pertama kali terdeteksi online hari ini
+        lastSeen: now.toISOString(),  // juga set initial lastSeen
+        undercover,
+        online: true,
+      };
+    } else {
+      // sudah ada, update lastSeen dan status + undercover (kalau undercover berubah)
+      state.mods[cleanName].lastSeen = now.toISOString();
+      state.mods[cleanName].online = true;
+      state.mods[cleanName].undercover = undercover || state.mods[cleanName].undercover;
+    }
+  }
+}
 
-    // Masukkan ke list online saat ini
-    stillOnlineMods.push({
-      name: rawLine,
-      cleanName: p.cleanName,
-      undercover: p.isUndercover,
-      seenRange: "", // bisa diisi nanti kalau kamu punya jam range
-      durationText: "", // bisa diisi nanti kalau punya durasi aktif
+// ====== REBUILD OUTPUT DATA UNTUK EMBED ======
+function buildModeratorSummary(state) {
+  // state.mods = {
+  //   "kailyx": {
+  //      firstSeen: "2025-10-29T14:36:12.000Z",
+  //      lastSeen:  "2025-10-29T16:35:10.000Z",
+  //      undercover: true,
+  //      online: true
+  //   },
+  //   "windyplay": {...}
+  // }
+
+  const now = nowDate();
+
+  // helper: make clean display for one mod
+  function modDisplayBlock(name, data, includeOnlineBadge) {
+    const first = new Date(data.firstSeen);
+    const last = new Date(data.lastSeen);
+
+    // durasi total = lastSeen - firstSeen
+    const durText = formatDuration(last - first);
+
+    // range jam: HH:mm–HH:mm
+    const rangeText = `${fmtHHMM(first)}–${fmtHHMM(last)}`;
+
+    // undercover tag
+    const undercoverLabel = data.undercover
+      ? " (<:undercover:1404369826293747834> Undercover)"
+      : "";
+
+    const statusLabel = includeOnlineBadge ? " (<a:ONLINE:1196722325463248937> Online)" : "";
+
+
+    return `${name}${undercoverLabel}${statusLabel} — ${durText} (${rangeText})`;
+  }
+
+  const currentlyOnlineLines = Object.entries(state.mods)
+    .filter(([_, data]) => data.online)
+    .sort((a, b) => a[0].localeCompare(b[0])) // urut alfabet
+    .map(([name, data]) => modDisplayBlock(name, data, true));
+
+  const seenTodayLines = Object.entries(state.mods)
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([name, data]) => {
+      return modDisplayBlock(name, data, false);
     });
 
-    // Simpan ke store names (union)
-    if (!store.names.includes(p.cleanName)) {
-      store.names.push(p.cleanName);
-    }
-  }
-
-  // Simpan kembali store harian (persist)
-  saveSeenTodayStore(store);
-
   return {
-    modsOnline: stillOnlineMods,
-    seenTodayList: store.names, // <- pakai store, bukan hanya online sekarang
+    currentlyOnlineText:
+      currentlyOnlineLines.length > 0
+        ? currentlyOnlineLines.join("\n")
+        : "Tidak ada moderator online.",
+    seenTodayText:
+      seenTodayLines.length > 0 ? seenTodayLines.join("\n") : "—",
   };
 }
 
-// ====== PLAYER COUNT / ONLINE USER ======
+// ====== GET PLAYER COUNT ======
 async function getPlayerData() {
   const res = await fetch(playerSource, {
     headers: {
@@ -203,37 +288,12 @@ async function getPlayerData() {
   };
 }
 
-// ====== BIKIN EMBED ======
-function buildEmbed({ playerInfo, modsOnline, seenTodayList }) {
-  const now = new Date();
+// ====== BUILD EMBED ======
+function buildEmbed({ playerInfo, summary }) {
+  const now = nowDate();
 
   const onlineCount = playerInfo?.online ?? "N/A";
-
-  // Baris moderator online
-  let onlineModsLines = "Tidak ada moderator online.";
-  if (modsOnline.length > 0) {
-    onlineModsLines = modsOnline
-      .map((m) => {
-        const base = m.cleanName || m.name || "unknown";
-
-        const undercoverLabel = m.undercover
-          ? " (<:undercover:1404369826293747834> Undercover)"
-          : "";
-
-        let suffix = "";
-        if (m.durationText) suffix += ` — ${m.durationText}`;
-        if (m.seenRange) suffix += ` (${m.seenRange})`;
-
-        return `${base}${undercoverLabel}${suffix}`;
-      })
-      .join("\n");
-  }
-
-  // List "Mods Seen Today" -> pakai store.names (persist)
-  const seenTodayBlock =
-    seenTodayList && seenTodayList.length
-      ? seenTodayList.join("\n")
-      : "—";
+  const lastUpdateHuman = formatFullDateTime(now);
 
   const todayStr = now.toLocaleDateString("id-ID", {
     timeZone: timezone,
@@ -241,9 +301,6 @@ function buildEmbed({ playerInfo, modsOnline, seenTodayList }) {
     month: "long",
     year: "numeric",
   });
-
-  const lastUpdateHuman = formatFullDateTime(now);
-  const lastUpdateShort = formatShortTime(now);
 
   return {
     username: serverName,
@@ -259,120 +316,100 @@ function buildEmbed({ playerInfo, modsOnline, seenTodayList }) {
           },
           {
             name: "<:ubisoft:1294935740542881862> Moderator/Guardian Currently Online",
-            value: onlineModsLines,
+            value: summary.currentlyOnlineText,
             inline: false,
           },
           {
             name: `📅 Mods Seen Today (${todayStr})`,
-            value: seenTodayBlock,
+            value: summary.seenTodayText,
             inline: false,
           },
         ],
         footer: {
-          text: `Last Update: ${lastUpdateHuman} ${lastUpdateShort}`,
+          text: `Last Update: ${lastUpdateHuman}`,
         },
-        timestamp: now.toISOString(),
       },
     ],
   };
 }
 
-// ====== DISCORD MESSAGE MANAGEMENT ======
+// ====== PATCH SATU PESAN SAJA ======
 function getExistingMessageId() {
   if (staticMessageId && staticMessageId.trim() !== "") {
     return staticMessageId.trim();
   }
-  if (fs.existsSync(savedMsgFile)) {
-    const fromFile = fs.readFileSync(savedMsgFile, "utf8").trim();
-    if (fromFile) return fromFile;
-  }
-  return null;
-}
-
-function saveMessageId(id) {
-  if (staticMessageId && staticMessageId.trim() !== "") return;
-  fs.writeFileSync(savedMsgFile, id);
+  throw new Error(
+    "config.json tidak punya 'messageId'. Tambahkan messageId agar bisa PATCH pesan yang sama."
+  );
 }
 
 async function sendOrEditWebhook(payload) {
   const msgId = getExistingMessageId();
 
-  if (msgId) {
-    const editUrl = `${webhookUrl}/messages/${msgId}`;
-    const res = await fetch(editUrl, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+  const editUrl = `${webhookUrl}/messages/${msgId}`;
+  const res = await fetch(editUrl, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
 
-    if (!res.ok) {
-      const bodyText = await res.text();
-      console.warn(
-        `[WARN] Gagal edit message ${msgId} (${res.status}): ${bodyText}`
-      );
-
-      // fallback kirim pesan baru
-      const newRes = await fetch(webhookUrl + "?wait=true", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-
-      if (!newRes.ok) {
-        const t2 = await newRes.text();
-        throw new Error(
-          `Gagal POST fallback: HTTP ${newRes.status} ${t2}`
-        );
-      }
-
-      const newData = await newRes.json();
-      saveMessageId(newData.id);
-      console.log(`[INFO] New message posted with id ${newData.id}`);
-    } else {
-      console.log(`[INFO] Edited message ${msgId}`);
-    }
-  } else {
-    // pertama kali post
-    const res = await fetch(webhookUrl + "?wait=true", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
-
-    if (!res.ok) {
-      const t = await res.text();
-      throw new Error(`Gagal POST pertama: ${res.status} ${t}`);
-    }
-
-    const data = await res.json();
-    saveMessageId(data.id);
-    console.log(`[INFO] First message posted with id ${data.id}`);
+  if (!res.ok) {
+    const bodyText = await res.text();
+    console.error(
+      `[ERR] Gagal edit message ${msgId} (${res.status}): ${bodyText}`
+    );
+    return;
   }
+
+  console.log(
+    `[OK] Edited message ${msgId} at ${new Date().toISOString()}`
+  );
 }
 
 // ====== MAIN LOOP ======
 async function postStatusOnce() {
   try {
-    const [modData, playerInfo] = await Promise.all([
-      getModeratorData(),
-      getPlayerData(),
-    ]);
+    const now = nowDate();
 
+    // 1. ambil state lama
+    let state = loadModState();
+
+    // 2. ambil daftar nama online saat ini dari gist
+    const currentOnlineNames = await fetchCurrentlyOnlineNames();
+
+    // 3. update state dengan daftar nama tersebut
+    updateModStateWithOnlineList(state, currentOnlineNames, now);
+
+    // 4. simpan state setelah update
+    saveModState(state);
+
+    // 5. generate summary text (online sekarang dan riwayat hari ini)
+    const summary = buildModeratorSummary(state);
+
+    // 6. ambil jumlah pemain online
+    const playerInfo = await getPlayerData();
+
+    // 7. bentuk payload embed
     const payload = buildEmbed({
       playerInfo,
-      modsOnline: modData.modsOnline,
-      seenTodayList: modData.seenTodayList,
+      summary,
     });
 
+    // 8. kirim PATCH ke webhook
     await sendOrEditWebhook(payload);
-    console.log(`[OK] Update terkirim ${new Date().toISOString()}`);
+
+    console.log(
+      `[OK] Update terkirim ${new Date().toISOString()} | OnlinePlayers:${playerInfo.online} | ModsOnlineNow:${Object.values(state.mods).filter(m => m.online).length} | ModsSeenToday:${Object.keys(state.mods).length}`
+    );
   } catch (err) {
-    console.error("[ERR]", err.message);
+    console.error("[FATAL]", err.message);
   }
 }
 
+// jalankan sekali
 postStatusOnce();
 
+// lalu ulangi tiap interval detik
 if (postIntervalSeconds && Number(postIntervalSeconds) > 0) {
   setInterval(postStatusOnce, Number(postIntervalSeconds) * 1000);
 }
