@@ -2,7 +2,9 @@
 
 import fetch from "node-fetch";
 import fs from "fs";
+import path from "path";
 
+// ====== CONFIG LOAD ======
 const cfg = JSON.parse(fs.readFileSync("./config.json", "utf8"));
 const {
   webhookUrl,
@@ -15,7 +17,9 @@ const {
 } = cfg;
 
 const savedMsgFile = "./last_message_id.txt";
+const seenTodayFile = "./seen_today.json";
 
+// ====== UTIL WAKTU ======
 function formatFullDateTime(d) {
   return d.toLocaleString("id-ID", {
     timeZone: timezone,
@@ -38,12 +42,58 @@ function formatShortTime(d) {
   });
 }
 
+// YYYY-MM-DD lokal (biar reset harian bener sesuai zona kamu)
+function getLocalDateString() {
+  const now = new Date();
+  // toLocaleDateString, tapi kita mau format 2025-10-29
+  const y = now.toLocaleString("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour12: false,
+  }); // "2025-10-29"
+  return y;
+}
+
+// ====== SEEN TODAY STORAGE ======
+function loadSeenTodayStore() {
+  const today = getLocalDateString();
+  try {
+    if (!fs.existsSync(seenTodayFile)) {
+      return { date: today, names: [] };
+    }
+    const raw = fs.readFileSync(seenTodayFile, "utf8");
+    const parsed = JSON.parse(raw);
+
+    // kalau tanggal beda -> reset
+    if (parsed.date !== today) {
+      return { date: today, names: [] };
+    }
+    if (!Array.isArray(parsed.names)) {
+      return { date: today, names: [] };
+    }
+    return parsed;
+  } catch {
+    return { date: today, names: [] };
+  }
+}
+
+function saveSeenTodayStore(store) {
+  fs.writeFileSync(
+    seenTodayFile,
+    JSON.stringify(store, null, 2),
+    "utf8"
+  );
+}
+
+// ====== SCRAPE MODERATOR DARI GIST (LIVE) ======
 async function getModeratorData() {
   const res = await fetch(moderatorSourcePage, {
     headers: {
       "User-Agent": "Mozilla/5.0",
       "Cache-Control": "no-cache",
-      Pragma: "no-cache",
+      "Pragma": "no-cache",
     },
   });
 
@@ -53,8 +103,11 @@ async function getModeratorData() {
 
   const html = await res.text();
 
+  // Ambil baris kode di gist (tiap baris di dalam <td class="blob-code ...">)
   const lineMatches = [
-    ...html.matchAll(/<td[^>]*class="blob-code[^"]*"[^>]*>([\s\S]*?)<\/td>/gi),
+    ...html.matchAll(
+      /<td[^>]*class="blob-code[^"]*"[^>]*>([\s\S]*?)<\/td>/gi
+    ),
   ];
 
   const rawLines = lineMatches
@@ -72,48 +125,63 @@ async function getModeratorData() {
     )
     .filter(Boolean);
 
-  const seenTodaySet = new Set();
-  const modsOnline = [];
-
+  // Parser undercover
   function parseNameForUndercover(rawName) {
     const name = rawName.trim();
+
+    // kailyx-undercover | kailyx_undercover | kailyx undercover
     const m = name.match(/^(.+?)[\-_ ]?undercover$/i);
     if (m) {
       return { cleanName: m[1].trim(), isUndercover: true };
     }
+
+    // kailyx (undercover), kailyx-Undercover, kailyx[undercover]
     const m2 = name.match(/^(.+?)\s*[\(\[\-]?undercover[\)\]\-]?$/i);
     if (m2) {
       return { cleanName: m2[1].trim(), isUndercover: true };
     }
+
     return { cleanName: name, isUndercover: false };
   }
+
+  // Ambil store lama (supaya "seen today" gak hilang pas mereka offline)
+  const store = loadSeenTodayStore();
+  const stillOnlineMods = [];
 
   for (const rawLine of rawLines) {
     const p = parseNameForUndercover(rawLine);
 
-    seenTodaySet.add(p.cleanName);
-
-    modsOnline.push({
+    // Masukkan ke list online saat ini
+    stillOnlineMods.push({
       name: rawLine,
       cleanName: p.cleanName,
       undercover: p.isUndercover,
-      seenRange: "",
-      durationText: "",
+      seenRange: "", // bisa diisi nanti kalau kamu punya jam range
+      durationText: "", // bisa diisi nanti kalau punya durasi aktif
     });
+
+    // Simpan ke store names (union)
+    if (!store.names.includes(p.cleanName)) {
+      store.names.push(p.cleanName);
+    }
   }
 
+  // Simpan kembali store harian (persist)
+  saveSeenTodayStore(store);
+
   return {
-    modsOnline,
-    seenTodayList: Array.from(seenTodaySet),
+    modsOnline: stillOnlineMods,
+    seenTodayList: store.names, // <- pakai store, bukan hanya online sekarang
   };
 }
 
+// ====== PLAYER COUNT / ONLINE USER ======
 async function getPlayerData() {
   const res = await fetch(playerSource, {
     headers: {
       "User-Agent": "Mozilla/5.0",
       "Cache-Control": "no-cache",
-      Pragma: "no-cache",
+      "Pragma": "no-cache",
     },
   });
 
@@ -124,7 +192,8 @@ async function getPlayerData() {
   const data = await res.json().catch(async () => {
     const fallbackText = await res.text();
     throw new Error(
-      "Response playerSource bukan JSON valid: " + fallbackText.slice(0, 200)
+      "Response playerSource bukan JSON valid: " +
+        fallbackText.slice(0, 200)
     );
   });
 
@@ -134,11 +203,13 @@ async function getPlayerData() {
   };
 }
 
+// ====== BIKIN EMBED ======
 function buildEmbed({ playerInfo, modsOnline, seenTodayList }) {
   const now = new Date();
 
   const onlineCount = playerInfo?.online ?? "N/A";
 
+  // Baris moderator online
   let onlineModsLines = "Tidak ada moderator online.";
   if (modsOnline.length > 0) {
     onlineModsLines = modsOnline
@@ -158,8 +229,11 @@ function buildEmbed({ playerInfo, modsOnline, seenTodayList }) {
       .join("\n");
   }
 
+  // List "Mods Seen Today" -> pakai store.names (persist)
   const seenTodayBlock =
-    seenTodayList && seenTodayList.length ? seenTodayList.join("\n") : "—";
+    seenTodayList && seenTodayList.length
+      ? seenTodayList.join("\n")
+      : "—";
 
   const todayStr = now.toLocaleDateString("id-ID", {
     timeZone: timezone,
@@ -195,7 +269,7 @@ function buildEmbed({ playerInfo, modsOnline, seenTodayList }) {
           },
         ],
         footer: {
-          text: `Last Update: ${lastUpdateHuman} `,
+          text: `Last Update: ${lastUpdateHuman} • Today at ${lastUpdateShort}`,
         },
         timestamp: now.toISOString(),
       },
@@ -203,6 +277,7 @@ function buildEmbed({ playerInfo, modsOnline, seenTodayList }) {
   };
 }
 
+// ====== DISCORD MESSAGE MANAGEMENT ======
 function getExistingMessageId() {
   if (staticMessageId && staticMessageId.trim() !== "") {
     return staticMessageId.trim();
@@ -220,7 +295,7 @@ function saveMessageId(id) {
 }
 
 async function sendOrEditWebhook(payload) {
-  let msgId = getExistingMessageId();
+  const msgId = getExistingMessageId();
 
   if (msgId) {
     const editUrl = `${webhookUrl}/messages/${msgId}`;
@@ -236,6 +311,7 @@ async function sendOrEditWebhook(payload) {
         `[WARN] Gagal edit message ${msgId} (${res.status}): ${bodyText}`
       );
 
+      // fallback kirim pesan baru
       const newRes = await fetch(webhookUrl + "?wait=true", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -244,7 +320,9 @@ async function sendOrEditWebhook(payload) {
 
       if (!newRes.ok) {
         const t2 = await newRes.text();
-        throw new Error(`Gagal POST fallback: HTTP ${newRes.status} ${t2}`);
+        throw new Error(
+          `Gagal POST fallback: HTTP ${newRes.status} ${t2}`
+        );
       }
 
       const newData = await newRes.json();
@@ -254,6 +332,7 @@ async function sendOrEditWebhook(payload) {
       console.log(`[INFO] Edited message ${msgId}`);
     }
   } else {
+    // pertama kali post
     const res = await fetch(webhookUrl + "?wait=true", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -271,6 +350,7 @@ async function sendOrEditWebhook(payload) {
   }
 }
 
+// ====== MAIN LOOP ======
 async function postStatusOnce() {
   try {
     const [modData, playerInfo] = await Promise.all([
